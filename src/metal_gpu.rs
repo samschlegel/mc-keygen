@@ -13,7 +13,7 @@ use crate::types::MeshCoreKeypair;
 
 const KERNEL_SRC: &str = include_str!("../metal/vanity_kernel.metal");
 const BLOCK_SIZE: u64 = 256;
-const ITERS_PER_THREAD: u64 = 256;
+const ITERS_PER_THREAD: u64 = 1024;
 
 pub struct MetalSearcher {
     queue: CommandQueue,

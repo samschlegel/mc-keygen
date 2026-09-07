@@ -3359,7 +3359,7 @@ int check_any_prefix(thread const u8 *pubkey, constant const u8 *prefix_data,
 }
 
 // Batch size for Montgomery inversion. Must divide iters_per_thread evenly.
-#define VANITY_BATCH 16
+#define VANITY_BATCH 256
 
 // Sequential-scalar search with Montgomery batch inversion. Each thread does
 // ONE scalarmult to derive its starting point, then iterates +8B (cheap point
