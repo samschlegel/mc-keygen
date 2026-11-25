@@ -3267,14 +3267,135 @@ typedef uint64_t u64;
 typedef unsigned char u8;
 
 // ============================================================================
+// Montgomery x-only chain
+// ============================================================================
+//
+// The search only needs the Ed25519 y coordinate (the pubkey minus its sign
+// bit, which the host recomputes from the scalar). Map each point to the
+// Montgomery curve, u = (1+y)/(1-y), and walk the +8B chain with x-only
+// differential addition: A_{i+1} = xADD(A_i, 8B, A_{i-1}). The difference
+// point is just the previous point, so the chain costs 4M+2S per step
+// instead of the 7M Edwards mixed add. Back to y: y = (u-1)/(u+1), which
+// the Montgomery batch inversion already pays for.
+
+constant fe mont_u8b_plus1  = { 13212009, 6028114, 19127854, 5598117, 32105399, 11951265, 29632228, 25541383, 24816997, 10321563 };
+constant fe mont_u8b_minus1 = { 13212007, 6028114, 19127854, 5598117, 32105399, 11951265, 29632228, 25541383, 24816997, 10321563 };
+
+typedef struct { fe U; fe Z; } mont_pt;
+
+// Projective Montgomery point from an extended Edwards point: u = (Z+Y)/(Z-Y).
+// Multiplies by one to carry-reduce the sums into fe_mul's input bounds.
+static void mont_from_p3(thread mont_pt *m, thread const ge_p3 *a) {
+    fe one; fe_1(one);
+    fe t;
+    fe_add(t, a->Z, a->Y); fe_mul(m->U, t, one);
+    fe_sub(t, a->Z, a->Y); fe_mul(m->Z, t, one);
+}
+
+// r = cur + 8B given prev = cur - 8B.
+static void mont_step(thread mont_pt *r, thread const mont_pt *cur, thread const mont_pt *prev,
+                      thread const fe cplus, thread const fe cminus) {
+    fe t0, t1, s, d;
+    fe_sub(t0, cur->U, cur->Z);
+    fe_add(t1, cur->U, cur->Z);
+    fe_mul(t0, t0, cplus);   // (U1-Z1)(U2+1)
+    fe_mul(t1, t1, cminus);  // (U1+Z1)(U2-1)
+    fe_add(s, t0, t1);
+    fe_sub(d, t0, t1);
+    fe_sq(s, s);
+    fe_sq(d, d);
+    fe_mul(r->U, prev->Z, s);
+    fe_mul(r->Z, prev->U, d);
+}
+
+// Per-thread chain state: A_i (p0) and A_{i+1} (p1).
+static void mont_chain_init(thread mont_pt *p0, thread mont_pt *p1, thread const u8 *scalar,
+                            thread fe cplus, thread fe cminus) {
+    ge_p3 A;
+    ge_scalarmult_base(&A, scalar);
+    // Stage 8B into thread space; MSL won't accept a `constant` pointer
+    // where `thread` is expected.
+    ge_precomp eight_B;
+    ge_precomp_copy_from_constant(&eight_B, &base[0][7]);
+    ge_p1p1 r;
+    ge_madd(&r, &A, &eight_B);
+    ge_p3 A1;
+    ge_p1p1_to_p3(&A1, &r);
+    mont_from_p3(p0, &A);
+    mont_from_p3(p1, &A1);
+    for (int k = 0; k < 10; k++) { cplus[k] = mont_u8b_plus1[k]; cminus[k] = mont_u8b_minus1[k]; }
+}
+
+// Advance: p0 <- p1, p1 <- p1 + 8B.
+static void mont_chain_advance(thread mont_pt *p0, thread mont_pt *p1,
+                               thread const fe cplus, thread const fe cminus) {
+    mont_pt n;
+    mont_step(&n, p1, p0, cplus, cminus);
+    *p0 = *p1;
+    *p1 = n;
+}
+
+// Batch size for Montgomery inversion. Must divide iters_per_thread evenly.
+#define VANITY_BATCH 256
+
+// Snapshot y = N/D numerator and denominator of p0 for VANITY_BATCH chain
+// steps, accumulating the running product of denominators, then invert once
+// and unwind so batch_D[i] holds D_i^{-1}. Advances the chain past the batch.
+static void mont_batch(thread mont_pt *p0, thread mont_pt *p1,
+                       thread const fe cplus, thread const fe cminus,
+                       thread fe *batch_N, thread fe *batch_D, thread fe *products) {
+    for (int i = 0; i < VANITY_BATCH; i++) {
+        fe_sub(batch_N[i], p0->U, p0->Z);
+        fe_add(batch_D[i], p0->U, p0->Z);
+        if (i == 0) {
+            for (int k = 0; k < 10; k++) products[i][k] = batch_D[i][k];
+        } else {
+            fe_mul(products[i], products[i-1], batch_D[i]);
+        }
+        mont_chain_advance(p0, p1, cplus, cminus);
+    }
+
+    fe all_inv;
+    fe_invert(all_inv, products[VANITY_BATCH - 1]);
+
+    // Backward pass; overwrites batch_D in place (each original value is
+    // rolled into `running` before being clobbered).
+    fe running;
+    for (int k = 0; k < 10; k++) running[k] = all_inv[k];
+    for (int i = VANITY_BATCH - 1; i > 0; i--) {
+        fe temp_inv;
+        fe_mul(temp_inv, running, products[i-1]);  // = D_i^{-1}
+        fe new_running;
+        fe_mul(new_running, running, batch_D[i]);  // = (D_0 * ... * D_{i-1})^{-1}
+        for (int k = 0; k < 10; k++) {
+            running[k] = new_running[k];
+            batch_D[i][k] = temp_inv[k];
+        }
+    }
+    for (int k = 0; k < 10; k++) batch_D[0][k] = running[k];
+}
+
+// start + 8 * offset into `scalar` (little-endian add with carry).
+static void scalar_add_offset(thread u8 *scalar, uint64_t offset) {
+    offset *= 8ULL;
+    uint64_t carry = 0;
+    for (int i = 0; i < 32; i++) {
+        uint64_t byte_add = (i < 8) ? ((offset >> (i * 8)) & 0xFFULL) : 0ULL;
+        uint64_t s = (uint64_t)scalar[i] + byte_add + carry;
+        scalar[i] = (u8)(s & 0xFFULL);
+        carry = s >> 8;
+    }
+}
+
+// ============================================================================
 // Verification kernel
 // ============================================================================
 
-// Single-threaded chain verifier. Walks the same sequential-scalar /
-// point-addition chain that vanity_search uses (one initial scalarmult,
-// then +8B per step) and writes the pubkey + scalar at every step. The
-// host compares against direct scalarmult via curve25519-dalek to confirm
-// both the initial mult AND the +8B chain stay in sync.
+// Single-threaded chain verifier. Walks the same Montgomery chain that
+// vanity_search uses and writes the pubkey (without the x sign bit) and
+// scalar at every step. The host compares against direct scalarmult via
+// curve25519-dalek, masking bit 255, to confirm both the initial mult AND
+// the +8B chain stay in sync.
 kernel void verify_keygen(
     const device u8 *start_scalar_bytes [[buffer(0)]],
     device u8 *pubkeys [[buffer(1)]],
@@ -3286,37 +3407,22 @@ kernel void verify_keygen(
     u8 my_scalar[32];
     for (int i = 0; i < 32; i++) my_scalar[i] = start_scalar_bytes[i];
 
-    ge_p3 A;
-    ge_scalarmult_base(&A, my_scalar);
-
-    // Stage 8B (= base[0][7]) into thread space so ge_madd can take its
-    // address; MSL won't accept a `constant` pointer where `thread` is
-    // expected.
-    ge_precomp eight_B;
-    ge_precomp_copy_from_constant(&eight_B, &base[0][7]);
+    mont_pt p0, p1; fe cplus, cminus;
+    mont_chain_init(&p0, &p1, my_scalar, cplus, cminus);
 
     for (unsigned int i = 0; i < count; i++) {
+        fe n, d, inv, y;
+        fe_sub(n, p0.U, p0.Z);
+        fe_add(d, p0.U, p0.Z);
+        fe_invert(inv, d);
+        fe_mul(y, n, inv);
         u8 local_pubkey[32];
-        ge_p3_tobytes(local_pubkey, &A);
+        fe_tobytes(local_pubkey, y);
         for (int j = 0; j < 32; j++) pubkeys[i * 32 + j] = local_pubkey[j];
         for (int j = 0; j < 32; j++) scalars[i * 32 + j] = my_scalar[j];
 
-        // A += 8B
-        ge_p1p1 r;
-        ge_madd(&r, &A, &eight_B);
-        ge_p1p1_to_p3(&A, &r);
-
-        // my_scalar += 8 (low-byte add with carry; stays clamped because we
-        // only touch bits >= 3 and the high-byte clamp bits won't roll for
-        // any plausible search length).
-        unsigned int sum = (unsigned int)my_scalar[0] + 8u;
-        my_scalar[0] = (u8)(sum & 0xFFu);
-        unsigned int carry = sum >> 8;
-        for (int j = 1; j < 32 && carry; j++) {
-            unsigned int s = (unsigned int)my_scalar[j] + carry;
-            my_scalar[j] = (u8)(s & 0xFFu);
-            carry = s >> 8;
-        }
+        mont_chain_advance(&p0, &p1, cplus, cminus);
+        scalar_add_offset(my_scalar, 1);
     }
 }
 
@@ -3340,7 +3446,6 @@ int check_prefix(thread const u8 *pubkey, constant const u8 *prefix_bytes,
 // Returns 1 if any prefix matches, 0 otherwise.
 int check_any_prefix(thread const u8 *pubkey, constant const u8 *prefix_data,
                      unsigned int prefix_count) {
-    // Skip past the count field (first 4 bytes already parsed by caller)
     constant const u8 *ptr = prefix_data + 4;
     for (unsigned int p = 0; p < prefix_count; p++) {
         unsigned int nibbles = ((unsigned int)ptr[0])
@@ -3350,7 +3455,6 @@ int check_any_prefix(thread const u8 *pubkey, constant const u8 *prefix_data,
         ptr += 4;
         constant const u8 *bytes = ptr;
         unsigned int byte_count = (nibbles + 1) / 2;
-        // Advance ptr past bytes + padding to 4-byte alignment
         unsigned int padded = (byte_count + 3) & ~3u;
         ptr += padded;
         if (check_prefix(pubkey, bytes, nibbles)) return 1;
@@ -3358,16 +3462,12 @@ int check_any_prefix(thread const u8 *pubkey, constant const u8 *prefix_data,
     return 0;
 }
 
-// Batch size for Montgomery inversion. Must divide iters_per_thread evenly.
-#define VANITY_BATCH 16
-
-// Sequential-scalar search with Montgomery batch inversion. Each thread does
-// ONE scalarmult to derive its starting point, then iterates +8B (cheap point
-// add). Compression (which needs Z^{-1}) is deferred and batched: gather B
-// points, do one fe_invert for the whole batch, then check each. Skipping the
-// X*Z^{-1} multiply on non-matches saves another fe_mul per iter (the prefix
-// check only touches the low bytes of the encoded y, where the sign bit
-// doesn't reach -- main.rs caps prefix length at 62 nibbles for that reason).
+// Sequential-scalar search. Each thread does ONE scalarmult to derive its
+// starting point, then walks the +8B Montgomery chain. Compression (which
+// needs a division) is deferred and batched: one fe_invert per VANITY_BATCH
+// points. The pubkey written back lacks the x sign bit; the host rebuilds
+// the full key from the scalar and checks the low 255 bits against this
+// (main.rs caps prefix length at 62 nibbles so the prefix never reaches it).
 kernel void vanity_search(
     device u8 *result [[buffer(0)]],
     constant u8 *prefix_data [[buffer(1)]],
@@ -3379,28 +3479,13 @@ kernel void vanity_search(
     // Per-thread starting scalar = start + 8 * tid * iters_per_thread.
     u8 my_scalar[32];
     for (int i = 0; i < 32; i++) my_scalar[i] = start_scalar_bytes[i];
-    {
-        uint64_t offset = 8ULL * (uint64_t)tid * iters_per_thread;
-        uint64_t carry = 0;
-        for (int i = 0; i < 32; i++) {
-            uint64_t byte_add = (i < 8) ? ((offset >> (i * 8)) & 0xFFULL) : 0ULL;
-            uint64_t s = (uint64_t)my_scalar[i] + byte_add + carry;
-            my_scalar[i] = (u8)(s & 0xFFULL);
-            carry = s >> 8;
-        }
-    }
+    scalar_add_offset(my_scalar, (uint64_t)tid * iters_per_thread);
 
-    ge_p3 A;
-    ge_scalarmult_base(&A, my_scalar);
+    mont_pt p0, p1; fe cplus, cminus;
+    mont_chain_init(&p0, &p1, my_scalar, cplus, cminus);
 
-    // Stage 8B into thread space (see verify_keygen for why).
-    ge_precomp eight_B;
-    ge_precomp_copy_from_constant(&eight_B, &base[0][7]);
-
-    // Per-thread batch storage. fe is int32[10] = 40 bytes.
-    fe batch_X[VANITY_BATCH];
-    fe batch_Y[VANITY_BATCH];
-    fe batch_Z[VANITY_BATCH];
+    fe batch_N[VANITY_BATCH];
+    fe batch_D[VANITY_BATCH];
     fe products[VANITY_BATCH];
 
     uint64_t batches = iters_per_thread / VANITY_BATCH;
@@ -3408,68 +3493,19 @@ kernel void vanity_search(
         if (atomic_load_explicit((device atomic_uint*)result, memory_order_relaxed) != 0)
             return;
 
-        // Phase 1: snapshot (X,Y,Z) at each chain step and accumulate the
-        // running product of Zs. After this loop A has advanced past the batch.
-        for (int i = 0; i < VANITY_BATCH; i++) {
-            for (int k = 0; k < 10; k++) {
-                batch_X[i][k] = A.X[k];
-                batch_Y[i][k] = A.Y[k];
-                batch_Z[i][k] = A.Z[k];
-            }
-            if (i == 0) {
-                for (int k = 0; k < 10; k++) products[i][k] = batch_Z[i][k];
-            } else {
-                fe_mul(products[i], products[i-1], batch_Z[i]);
-            }
-            ge_p1p1 r;
-            ge_madd(&r, &A, &eight_B);
-            ge_p1p1_to_p3(&A, &r);
-        }
+        mont_batch(&p0, &p1, cplus, cminus, batch_N, batch_D, products);
 
-        // Phase 2: one inversion of the full product.
-        fe all_inv;
-        fe_invert(all_inv, products[VANITY_BATCH - 1]);
-
-        // Phase 3: backward pass to extract individual Z inverses. Overwrites
-        // batch_Z in place (its original values get rolled into `running`
-        // before being clobbered).
-        fe running;
-        for (int k = 0; k < 10; k++) running[k] = all_inv[k];
-        for (int i = VANITY_BATCH - 1; i > 0; i--) {
-            fe temp_inv;
-            fe_mul(temp_inv, running, products[i-1]);  // = Z_i^{-1}
-            fe new_running;
-            fe_mul(new_running, running, batch_Z[i]);  // = (Z_0 * ... * Z_{i-1})^{-1}
-            for (int k = 0; k < 10; k++) {
-                running[k] = new_running[k];
-                batch_Z[i][k] = temp_inv[k];
-            }
-        }
-        for (int k = 0; k < 10; k++) batch_Z[0][k] = running[k];
-
-        // Phase 4: compute y = Y/Z, encode, prefix-check each point.
         for (int i = 0; i < VANITY_BATCH; i++) {
             fe y;
-            fe_mul(y, batch_Y[i], batch_Z[i]);
+            fe_mul(y, batch_N[i], batch_D[i]);
             u8 pubkey[32];
             fe_tobytes(pubkey, y);
 
             if (pubkey[0] != 0x00 && pubkey[0] != 0xFF
                 && check_any_prefix(pubkey, prefix_data, prefix_count)) {
-                fe x;
-                fe_mul(x, batch_X[i], batch_Z[i]);
-                pubkey[31] ^= fe_isnegative(x) << 7;
-
                 u8 match_scalar[32];
                 for (int k = 0; k < 32; k++) match_scalar[k] = my_scalar[k];
-                uint64_t matched_offset = 8ULL * (b * VANITY_BATCH + (uint64_t)i);
-                uint64_t carry = 0;
-                for (int k = 0; k < 32; k++) {
-                    uint64_t byte_add = (k < 8) ? ((matched_offset >> (k * 8)) & 0xFFULL) : 0ULL;
-                    uint64_t s = (uint64_t)match_scalar[k] + byte_add + carry;
-                    match_scalar[k] = (u8)(s & 0xFFULL);
-                    carry = s >> 8;
-                }
+                scalar_add_offset(match_scalar, b * VANITY_BATCH + (uint64_t)i);
 
                 uint old = atomic_exchange_explicit(
                     (device atomic_uint*)result, 1, memory_order_relaxed);
@@ -3496,72 +3532,24 @@ kernel void vanity_count_matches(
 {
     u8 my_scalar[32];
     for (int i = 0; i < 32; i++) my_scalar[i] = start_scalar_bytes[i];
-    {
-        uint64_t offset = 8ULL * (uint64_t)tid * iters_per_thread;
-        uint64_t carry = 0;
-        for (int i = 0; i < 32; i++) {
-            uint64_t byte_add = (i < 8) ? ((offset >> (i * 8)) & 0xFFULL) : 0ULL;
-            uint64_t s = (uint64_t)my_scalar[i] + byte_add + carry;
-            my_scalar[i] = (u8)(s & 0xFFULL);
-            carry = s >> 8;
-        }
-    }
+    scalar_add_offset(my_scalar, (uint64_t)tid * iters_per_thread);
 
-    ge_p3 A;
-    ge_scalarmult_base(&A, my_scalar);
+    mont_pt p0, p1; fe cplus, cminus;
+    mont_chain_init(&p0, &p1, my_scalar, cplus, cminus);
 
-    // Stage 8B into thread space (see verify_keygen for why).
-    ge_precomp eight_B;
-    ge_precomp_copy_from_constant(&eight_B, &base[0][7]);
-
-    fe batch_Y[VANITY_BATCH];
-    fe batch_Z[VANITY_BATCH];
+    fe batch_N[VANITY_BATCH];
+    fe batch_D[VANITY_BATCH];
     fe products[VANITY_BATCH];
 
     unsigned int local_matches = 0;
 
     uint64_t batches = iters_per_thread / VANITY_BATCH;
     for (uint64_t b = 0; b < batches; b++) {
-        // Phase 1: snapshot (Y,Z) and accumulate products. X not needed since
-        // we only count matches, not emit pubkeys.
-        for (int i = 0; i < VANITY_BATCH; i++) {
-            for (int k = 0; k < 10; k++) {
-                batch_Y[i][k] = A.Y[k];
-                batch_Z[i][k] = A.Z[k];
-            }
-            if (i == 0) {
-                for (int k = 0; k < 10; k++) products[i][k] = batch_Z[i][k];
-            } else {
-                fe_mul(products[i], products[i-1], batch_Z[i]);
-            }
-            ge_p1p1 r;
-            ge_madd(&r, &A, &eight_B);
-            ge_p1p1_to_p3(&A, &r);
-        }
+        mont_batch(&p0, &p1, cplus, cminus, batch_N, batch_D, products);
 
-        // Phase 2: one inversion.
-        fe all_inv;
-        fe_invert(all_inv, products[VANITY_BATCH - 1]);
-
-        // Phase 3: backward extract Z inverses.
-        fe running;
-        for (int k = 0; k < 10; k++) running[k] = all_inv[k];
-        for (int i = VANITY_BATCH - 1; i > 0; i--) {
-            fe temp_inv;
-            fe_mul(temp_inv, running, products[i-1]);
-            fe new_running;
-            fe_mul(new_running, running, batch_Z[i]);
-            for (int k = 0; k < 10; k++) {
-                running[k] = new_running[k];
-                batch_Z[i][k] = temp_inv[k];
-            }
-        }
-        for (int k = 0; k < 10; k++) batch_Z[0][k] = running[k];
-
-        // Phase 4: count matches.
         for (int i = 0; i < VANITY_BATCH; i++) {
             fe y;
-            fe_mul(y, batch_Y[i], batch_Z[i]);
+            fe_mul(y, batch_N[i], batch_D[i]);
             u8 pubkey[32];
             fe_tobytes(pubkey, y);
             if (pubkey[0] != 0x00 && pubkey[0] != 0xFF

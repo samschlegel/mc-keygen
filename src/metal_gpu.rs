@@ -13,7 +13,7 @@ use crate::types::MeshCoreKeypair;
 
 const KERNEL_SRC: &str = include_str!("../metal/vanity_kernel.metal");
 const BLOCK_SIZE: u64 = 256;
-const ITERS_PER_THREAD: u64 = 256;
+const ITERS_PER_THREAD: u64 = 1024;
 
 pub struct MetalSearcher {
     queue: CommandQueue,
@@ -52,6 +52,12 @@ impl fmt::Display for MetalError {
 }
 
 impl std::error::Error for MetalError {}
+
+/// Compare compressed points ignoring the x sign bit (bit 255), which the
+/// GPU's x-only chain does not compute.
+fn eq_low255(a: &[u8], b: &[u8]) -> bool {
+    a[..31] == b[..31] && (a[31] & 0x7f) == (b[31] & 0x7f)
+}
 
 fn compile_kernel(device: &Device) -> Result<metal::Library, MetalError> {
     let options = CompileOptions::new();
@@ -197,14 +203,17 @@ impl MetalSearcher {
             let mut scalar = [0u8; 32];
             scalar.copy_from_slice(&result_host[36..68]);
 
-            // Defensive: verify scalar*B == pubkey via curve25519-dalek before
-            // handing the user a private key derived from GPU output.
-            {
+            // The kernel walks an x-only Montgomery chain and cannot produce
+            // the x sign bit (bit 255), so rebuild the full pubkey from the
+            // scalar via curve25519-dalek and require the low 255 bits to
+            // match. This is also the defensive check before handing the
+            // user a private key derived from GPU output.
+            let public_key = {
                 use curve25519_dalek::constants::ED25519_BASEPOINT_TABLE;
                 use curve25519_dalek::scalar::Scalar;
                 let s = Scalar::from_bytes_mod_order(scalar);
                 let cpu_pub = (&s * ED25519_BASEPOINT_TABLE).compress().to_bytes();
-                if cpu_pub != public_key {
+                if !eq_low255(&cpu_pub, &public_key) {
                     return Err(MetalError::Runtime(format!(
                         "GPU match validation failed: scalar·B != pubkey\n  scalar:  {}\n  GPU pub: {}\n  CPU pub: {}",
                         hex::encode_upper(scalar),
@@ -212,7 +221,8 @@ impl MetalSearcher {
                         hex::encode_upper(cpu_pub),
                     )));
                 }
-            }
+                cpu_pub
+            };
 
             let mut prefix = [0u8; 32];
             OsRng.fill_bytes(&mut prefix);
@@ -372,7 +382,7 @@ pub fn verify_gpu_keygen() -> Result<(), MetalError> {
         let gpu_pub = &gpu_pubkeys[i * 32..(i + 1) * 32];
         let gpu_scalar = &gpu_scalars[i * 32..(i + 1) * 32];
 
-        let pub_match = gpu_pub == cpu_pub;
+        let pub_match = eq_low255(gpu_pub, &cpu_pub);
         let scalar_match = gpu_scalar == expected_scalar;
 
         if pub_match && scalar_match {
